@@ -1,0 +1,5 @@
+2026/03/11-13:49:56.194 8448 Creating DB C:\Users\Владислав\Desktop\sqlbot\.qwen-profile\Default\Local Storage\leveldb since it was missing.
+2026/03/11-13:49:56.223 8448 Reusing MANIFEST C:\Users\Владислав\Desktop\sqlbot\.qwen-profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/03/11-13:50:05.647 68d0 Level-0 table #5: started
+2026/03/11-13:50:05.656 68d0 Level-0 table #5: 137736 bytes OK
+2026/03/11-13:50:05.662 68d0 Delete type=0 #3
