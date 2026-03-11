@@ -1,4 +1,6 @@
+import base64
 import logging
+import mimetypes
 import os
 import time
 from typing import Any, Dict, Optional
@@ -56,6 +58,24 @@ def telegram_request(token: str, method: str, payload: Optional[Dict[str, Any]] 
 def ensure_polling_mode(token: str) -> None:
     telegram_request(token, "deleteWebhook", {"drop_pending_updates": False})
     logging.info("Telegram webhook cleared, polling mode enabled")
+
+
+def telegram_download_file(token: str, file_id: str) -> tuple[bytes, str]:
+    file_info = telegram_request(token, "getFile", {"file_id": file_id})
+    result = file_info.get("result", {})
+    file_path = result.get("file_path")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise RuntimeError("Telegram did not return a downloadable file path.")
+
+    file_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    response = requests.get(file_url, timeout=TELEGRAM_HTTP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if not mime_type:
+        mime_type = "image/jpeg"
+
+    return response.content, mime_type
 
 
 class QwenApiClient:
@@ -123,14 +143,11 @@ class QwenApiClient:
                 return message.strip()
         return str(payload)
 
-    def generate_sql(self, user_text: str) -> str:
+    def _send_messages(self, messages: list[Dict[str, Any]]) -> str:
         logging.info("Sending request to Qwen API, model=%s", self.model)
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": SQL_SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
+            "messages": messages,
             "stream": False,
         }
         headers = {
@@ -188,21 +205,51 @@ class QwenApiClient:
 
         raise RuntimeError("Qwen API request failed after retries.")
 
+    def generate_sql(self, user_text: str) -> str:
+        return self._send_messages(
+            [
+                {"role": "system", "content": SQL_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ]
+        )
+
+    def generate_sql_from_image(self, image_bytes: bytes, mime_type: str, user_text: str) -> str:
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_data_url = f"data:{mime_type};base64,{image_base64}"
+        return self._send_messages(
+            [
+                {"role": "system", "content": SQL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                        {"type": "text", "text": user_text},
+                    ],
+                },
+            ]
+        )
+
 
 def build_welcome_text() -> str:
     return (
         "Привет! Я SQL-бот.\n"
-        "Пришли задание или SQL-запрос, и я верну готовый SQL.\n\n"
+        "Пришли текст, SQL-запрос или фото с заданием, и я верну готовый SQL.\n\n"
         "Пример:\n"
         "Сделай запрос: вывести топ-10 клиентов по сумме заказов за 2025 год."
     )
 
 
-def handle_message(qwen_client: QwenApiClient, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def handle_message(
+    qwen_client: QwenApiClient,
+    telegram_token: str,
+    message: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     chat = message.get("chat", {})
     chat_id = chat.get("id")
     text = message.get("text", "")
-    if not chat_id or not text:
+    caption = message.get("caption", "")
+    photo_list = message.get("photo") or []
+    if not chat_id:
         return None
 
     lowered = text.strip().lower()
@@ -211,11 +258,33 @@ def handle_message(qwen_client: QwenApiClient, message: Dict[str, Any]) -> Optio
         return {"chat_id": chat_id, "text": build_welcome_text()}
 
     try:
-        preview = text.replace("\r", " ").replace("\n", " ").strip()
-        if len(preview) > 120:
-            preview = f"{preview[:117]}..."
-        logging.info("Received SQL task from chat_id=%s: %s", chat_id, preview)
-        sql = qwen_client.generate_sql(text)
+        if isinstance(photo_list, list) and photo_list:
+            photo = photo_list[-1]
+            file_id = photo.get("file_id")
+            if not isinstance(file_id, str) or not file_id.strip():
+                raise RuntimeError("Telegram photo payload does not contain file_id.")
+
+            prompt_text = caption.strip() or (
+                "Extract the task from the image and return only the final SQL."
+            )
+            preview = prompt_text.replace("\r", " ").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = f"{preview[:117]}..."
+            logging.info("Received photo task from chat_id=%s: %s", chat_id, preview)
+            image_bytes, mime_type = telegram_download_file(telegram_token, file_id)
+            sql = qwen_client.generate_sql_from_image(image_bytes, mime_type, prompt_text)
+        else:
+            if not text:
+                return {
+                    "chat_id": chat_id,
+                    "text": "Пришли текстовое задание, SQL или фото с заданием.",
+                }
+
+            preview = text.replace("\r", " ").replace("\n", " ").strip()
+            if len(preview) > 120:
+                preview = f"{preview[:117]}..."
+            logging.info("Received SQL task from chat_id=%s: %s", chat_id, preview)
+            sql = qwen_client.generate_sql(text)
     except Exception as exc:
         logging.exception("SQL generation failed")
         return {
@@ -280,7 +349,7 @@ def run_bot() -> None:
                     if not message:
                         logging.info("Skipping non-message update_id=%s", offset)
                         continue
-                    reply = handle_message(qwen_client, message)
+                    reply = handle_message(qwen_client, telegram_token, message)
                     if reply:
                         telegram_request(telegram_token, "sendMessage", reply)
                         logging.info("Reply sent to chat_id=%s", reply.get("chat_id"))
